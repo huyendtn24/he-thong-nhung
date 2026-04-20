@@ -83,7 +83,7 @@ void sendSensorData() {
         lastPumpState = true; 
       }
     } 
-    else if (soilPercent > 60) {
+    else if (soilPercent > 80) {
       digitalWrite(PUMP_PIN, LOW);
       Blynk.virtualWrite(V5, 0); 
       
