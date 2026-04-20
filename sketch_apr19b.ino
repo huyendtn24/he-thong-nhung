@@ -22,8 +22,7 @@ char pass[] = "97474074";
 #define SOIL_PIN 34
 #define LIGHT_PIN 32
 #define PUMP_PIN 16
-#define LED_PIN 17      // Chân này bây giờ nối vào chân SIG của module MOSFET
-#define I2C_SDA 25
+#define LED_PIN 17      
 #define I2C_SCL 26
 
 // --- CẤU HÌNH PWM CHO MOSFET ---
@@ -119,7 +118,7 @@ void sendSensorData() {
 }
 
 // ----------------------------------------------------
-// CÁC HÀM XỬ LÝ NÚT BẤM TRÊN ĐIỆN THOẠI
+// CÁC HÀM XỬ LÝ NÚT BẤM TRÊN ĐIỆN THOẠI/WEB
 // ----------------------------------------------------
 
 // Nút V0: Chọn chế độ (Tự Động / Thủ Công)
