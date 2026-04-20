@@ -1,4 +1,3 @@
-// 1. Cấu hình cơ bản Blynk
 #define BLYNK_TEMPLATE_ID "TMPL6Z_W2RFTo"
 #define BLYNK_TEMPLATE_NAME "thinghiemiot"
 #define BLYNK_AUTH_TOKEN "KxHzlfsl6YpC3ofnAt1zlSxJMJemn5lP"
@@ -11,186 +10,169 @@
 #include <LiquidCrystal_I2C.h>
 #include <DHT.h>
 
-// Thông tin WiFi
-char auth[] = BLYNK_AUTH_TOKEN;
+// --- THÔNG TIN KẾT NỐI ---
 char ssid[] = "TP-Link_987E";
 char pass[] = "97474074";
 
-// Cấu hình chân
+// --- CẤU HÌNH CHÂN PIN ---
 #define DHTPIN 15
 #define DHTTYPE DHT11
 #define SOIL_PIN 34
 #define LIGHT_PIN 32
 #define PUMP_PIN 16
-#define LED_PIN 17      
+#define LED_PIN 17 
+#define I2C_SDA 25
 #define I2C_SCL 26
 
-// --- CẤU HÌNH PWM CHO MOSFET ---
-const int pwmFreq = 5000;      // Tần số băm xung 5kHz (Chống mỏi mắt, phù hợp với LED)
-const int pwmResolution = 8;   // Độ phân giải 8-bit (Dải giá trị độ sáng từ 0 - 255)
-int currentBrightness = 0;     // Biến lưu độ sáng hiện tại
+// --- CẤU HÌNH PWM (LEDC) ---
+const int pwmFreq = 5000;
+const int pwmResolution = 8;
+
+// --- QUẢN LÝ NGẮT CỨNG (Cú pháp Core 3.x) ---
+hw_timer_t * hwtimer = NULL;
+volatile bool sensorTaskFlag = false; 
+
+// --- BIẾN TRẠNG THÁI ---
+bool isAutoMode = true; 
+bool lastPumpState = false;
+bool lastLEDState = false;
 
 DHT dht(DHTPIN, DHTTYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
-BlynkTimer timer;
 
-// BIẾN QUẢN LÝ CHẾ ĐỘ (Khởi động lên mặc định là Tự động)
-bool isAutoMode = true; 
+// =========================================================
+// 1. HÀM PHỤC VỤ NGẮT (ISR)
+// =========================================================
+void IRAM_ATTR onTimerInterrupt() {
+  sensorTaskFlag = true; 
+}
 
-// Cờ nhớ trạng thái (Chống Spam)
-bool lastPumpState = false; 
-bool lastLEDState = false;
+// =========================================================
+// 2. HÀM ĐIỀU KHIỂN THIẾT BỊ (ĐÃ TỐI ƯU)
+// =========================================================
+void controlPump(bool turnOn, bool isManual = false) {
+  digitalWrite(PUMP_PIN, turnOn ? HIGH : LOW);
+  
+  if (turnOn != lastPumpState) {
+    Blynk.virtualWrite(V5, turnOn ? 1 : 0);
+    String action = turnOn ? "BẬT" : "TẮT";
+    String mode = isManual ? " (Thủ công)" : " (Tự động)";
+    Blynk.logEvent(turnOn ? "thong_bao_bat" : "thong_bao_tat", "Máy bơm: " + action + mode);
+    lastPumpState = turnOn;
+  }
+}
 
-void sendSensorData() {
+void controlLED(int brightness, bool isManual = false) {
+  ledcWrite(LED_PIN, brightness);
+  bool currentState = (brightness > 0);
+  
+  if (currentState != lastLEDState) {
+    Blynk.virtualWrite(V6, brightness);
+    String action = currentState ? "BẬT" : "TẮT";
+    String mode = isManual ? " (Thủ công)" : " (Tự động)";
+    Blynk.logEvent(currentState ? "thong_bao_bat" : "thong_bao_tat", "Đèn LED: " + action + mode);
+    lastLEDState = currentState;
+  }
+}
+
+// =========================================================
+// 3. LOGIC XỬ LÝ TRUNG TÂM
+// =========================================================
+void executeSensorLogic() {
   float h = dht.readHumidity();
   float t = dht.readTemperature();
+  // Map ADC 12-bit (0-4095) về %, xử lý giá trị biên
   int soilPercent = constrain(map(analogRead(SOIL_PIN), 4095, 1000, 0, 100), 0, 100);
   int lightPercent = constrain(map(analogRead(LIGHT_PIN), 4095, 0, 0, 100), 0, 100);
 
-  // Cập nhật LCD
-  lcd.clear(); 
-  lcd.setCursor(0, 0);
-  lcd.print("T:"); lcd.print((int)t); lcd.print("C");
-  lcd.setCursor(8, 0);
-  lcd.print("H:"); lcd.print((int)h); lcd.print("%");
-  lcd.setCursor(0, 1);
-  lcd.print("S:"); lcd.print(soilPercent); lcd.print("%");
-  lcd.setCursor(8, 1);
-  lcd.print("L:"); lcd.print(lightPercent); lcd.print("%");
+  // Cập nhật LCD (In đè để tránh clear màn hình gây nháy)
+  lcd.setCursor(0, 0); lcd.print("T:" + String((int)t) + "C  H:" + String((int)h) + "%   ");
+  lcd.setCursor(0, 1); lcd.print("S:" + String(soilPercent) + "%  L:" + String(lightPercent) + "%   ");
 
-  // Gửi thông số lên App
+  // Đẩy dữ liệu lên Cloud
   Blynk.virtualWrite(V1, t);
   Blynk.virtualWrite(V2, soilPercent);
   Blynk.virtualWrite(V3, lightPercent);
   Blynk.virtualWrite(V4, h);
-  
-  // Đồng bộ trạng thái nút V0 lên màn hình điện thoại
   Blynk.virtualWrite(V0, isAutoMode ? 1 : 0);
 
-  // ----------------------------------------------------
-  // KHỐI LOGIC NÀY CHỈ CHẠY KHI Ở CHẾ ĐỘ TỰ ĐỘNG
-  // ----------------------------------------------------
-  if (isAutoMode == true) {
-    
-    // --- Tự động Máy Bơm (Giữ nguyên dùng Relay) ---
-    if (soilPercent < 40) {
-      digitalWrite(PUMP_PIN, HIGH);
-      Blynk.virtualWrite(V5, 1); 
-      
-      if (lastPumpState == false) { 
-        Blynk.logEvent("thong_bao_bat", "Đất khô, tự động BẬT bơm!");
-        lastPumpState = true; 
-      }
-    } 
-    else if (soilPercent > 80) {
-      digitalWrite(PUMP_PIN, LOW);
-      Blynk.virtualWrite(V5, 0); 
-      
-      if (lastPumpState == true) { 
-        Blynk.logEvent("thong_bao_tat", "Đất đủ ẩm, tự động TẮT bơm!");
-        lastPumpState = false;
-      }
-    }
+  // Logic Auto Mode
+  if (isAutoMode) {
+    // Bơm: Hysteresis 40% - 60%
+    if (soilPercent < 40) controlPump(true);
+    else if (soilPercent > 70) controlPump(false);
 
-    // --- Tự động Đèn LED (Dùng MOSFET Điều sáng tuyến tính) ---
+    // Đèn LED: Dimming khi sáng < 30%
     if (lightPercent < 30) {
-      // Logic Dimming: Ánh sáng tự nhiên càng yếu (<30%), đèn bật càng sáng (từ 100 đến 255)
-      currentBrightness = map(lightPercent, 0, 30, 255, 100);
-      ledcWrite(LED_PIN, currentBrightness); // Hàm xuất PWM mới của ESP32
-      Blynk.virtualWrite(V6, currentBrightness); // Đồng bộ thanh trượt V6 trên App
-      
-      if (lastLEDState == false) {
-        Blynk.logEvent("thong_bao_bat", "Trời tối, tự động BẬT đèn bù sáng!");
-        lastLEDState = true;
-      }
-    } 
-    else if (lightPercent > 70) {
-      currentBrightness = 0; // Tắt đèn hoàn toàn
-      ledcWrite(LED_PIN, currentBrightness);
-      Blynk.virtualWrite(V6, currentBrightness); 
-      
-      if (lastLEDState == true) {
-        Blynk.logEvent("thong_bao_tat", "Trời sáng, tự động TẮT đèn!");
-        lastLEDState = false;
-      }
+      int brightness = map(lightPercent, 0, 30, 255, 100);
+      controlLED(brightness);
+    } else if (lightPercent > 70) {
+      controlLED(0);
     }
   }
 }
 
-// ----------------------------------------------------
-// CÁC HÀM XỬ LÝ NÚT BẤM TRÊN ĐIỆN THOẠI/WEB
-// ----------------------------------------------------
-
-// Nút V0: Chọn chế độ (Tự Động / Thủ Công)
+// =========================================================
+// 4. CALL BACKS TỪ BLYNK APP
+// =========================================================
 BLYNK_WRITE(V0) {
-  if (param.asInt() == 1) {
-    isAutoMode = true;
-    Blynk.logEvent("thong_bao_bat", "Hệ thống: Đã bật chế độ TỰ ĐỘNG");
-  } else {
-    isAutoMode = false;
-    Blynk.logEvent("thong_bao_tat", "Hệ thống: Đã bật chế độ THỦ CÔNG");
-  }
+  isAutoMode = (param.asInt() == 1);
+  Blynk.logEvent(isAutoMode ? "thong_bao_bat" : "thong_bao_tat", 
+                 isAutoMode ? "Hệ thống: TỰ ĐỘNG" : "Hệ thống: THỦ CÔNG");
 }
 
-// Nút V5: Điều khiển Bơm thủ công (Relay)
 BLYNK_WRITE(V5) {
   isAutoMode = false; 
-  Blynk.virtualWrite(V0, 0); 
-
-  int value = param.asInt();
-  if (value == 1) {
-    digitalWrite(PUMP_PIN, HIGH); 
-    Blynk.logEvent("thong_bao_bat", "Đã BẬT máy bơm (Bằng tay)");
-    lastPumpState = true;
-  } else {
-    digitalWrite(PUMP_PIN, LOW); 
-    Blynk.logEvent("thong_bao_tat", "Đã TẮT máy bơm (Bằng tay)");
-    lastPumpState = false;
-  }
+  controlPump(param.asInt() == 1, true);
 }
 
-// Slider V6: Điều khiển Đèn thủ công (MOSFET)
 BLYNK_WRITE(V6) {
-  // Ghi đè thông minh: Kéo slider V6 là tự động giật quyền về Thủ công
   isAutoMode = false;
-  Blynk.virtualWrite(V0, 0); 
-
-  currentBrightness = param.asInt(); // Nhận giá trị từ 0 - 255
-  ledcWrite(LED_PIN, currentBrightness); 
-
-  // Xử lý gửi thông báo chống Spam cho Slider
-  if (currentBrightness > 0 && lastLEDState == false) {
-    Blynk.logEvent("thong_bao_bat", "Đã BẬT đèn LED (Bằng tay)");
-    lastLEDState = true;
-  } else if (currentBrightness == 0 && lastLEDState == true) {
-    Blynk.logEvent("thong_bao_tat", "Đã TẮT đèn LED (Bằng tay)");
-    lastLEDState = false;
-  }
+  controlLED(param.asInt(), true);
 }
 
-// ----------------------------------------------------
+// =========================================================
+// 5. SETUP & LOOP
+// =========================================================
 void setup() {
   Serial.begin(115200);
   Wire.begin(I2C_SDA, I2C_SCL);
+  
   lcd.init();
   lcd.backlight();
-  
-  pinMode(PUMP_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, LOW); // Tắt bơm lúc đầu
+  lcd.print("ESP32 Core 3.x");
 
-  // Khởi tạo PWM cho MOSFET (Sử dụng cú pháp chuẩn ESP32 Core 3.x)
+  pinMode(PUMP_PIN, OUTPUT);
+  digitalWrite(PUMP_PIN, LOW); // Fail-safe: Tắt bơm khi khởi động
+
+  // Khởi tạo PWM (Chuẩn mới cho Core 3.x)
   ledcAttach(LED_PIN, pwmFreq, pwmResolution);
-  ledcWrite(LED_PIN, 0); // Đảm bảo đèn tắt khi vừa bật nguồn
+  ledcWrite(LED_PIN, 0);
 
   dht.begin();
-  Blynk.begin(auth, ssid, pass);
-  timer.setInterval(2000L, sendSensorData);
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, pass);
+
+  // --- CẤU HÌNH HARDWARE TIMER (CÚ PHÁP MỚI CORE 3.X) ---
+  // Tần số 1MHz => 1 nhịp đếm = 1 micro-giây
+  hwtimer = timerBegin(1000000); 
   
-  lcd.setCursor(0, 0);
-  lcd.print("Blynk Connected!");
+  // Gán hàm ngắt
+  timerAttachInterrupt(hwtimer, &onTimerInterrupt);
+
+  // Đặt báo thức 2 giây (2,000,000 micro-giây), tự động nạp lại
+  timerAlarm(hwtimer, 2000000, true, 0); 
+
+  lcd.clear();
+  lcd.print("System Ready!");
+  
 }
 
 void loop() {
   Blynk.run();
-  timer.run();
+  
+  // Kiểm tra cờ từ Hardware Timer
+  if (sensorTaskFlag) {
+    sensorTaskFlag = false; 
+    executeSensorLogic();   
+  }
 }
