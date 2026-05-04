@@ -1,329 +1,216 @@
-/*
- * Project: Hệ thống giám sát Nhà Nấm IoT
- * Version: FINAL (ESP32 Core 3.x - Stable)
- * Description:
- *  - Hệ thống sử dụng ESP32 để giám sát nhiệt độ, độ ẩm, ánh sáng, độ ẩm đất
- *  - Điều khiển bơm và đèn theo chế độ Auto/Manual
- *  - Giao tiếp với Blynk Cloud và hiển thị LCD
- */
-
 #define BLYNK_TEMPLATE_ID "TMPL6Z_W2RFTo"
 #define BLYNK_TEMPLATE_NAME "thinghiemiot"
-#define BLYNK_AUTH_TOKEN "KxHzlfsl6YpC3ofnAt1zlSxJMJemn5lP"
+#define BLYNK_AUTH_TOKEN "BOWM3FA_jUKbfrCifmy5iONd9x8Se3ub"
 
 #define BLYNK_PRINT Serial
+#include <WiFi.h>
+#include <WiFiClient.h>
+#include <BlynkSimpleEsp32.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <DHT.h>
 
-// ================= LIBRARY =================
-#include <WiFi.h>                  // WiFi ESP32
-#include <BlynkSimpleEsp32.h>     // Blynk IoT
-#include <Wire.h>                 // I2C
-#include <LiquidCrystal_I2C.h>    // LCD I2C
-#include <DHT.h>                  // Cảm biến DHT
-
-// ================= WIFI =================
+// Thông tin WiFi
+char auth[] = BLYNK_AUTH_TOKEN;
 char ssid[] = "TP-Link_987E";
 char pass[] = "97474074";
 
-// ================= PIN =================
+// Cấu hình chân
 #define DHTPIN 15
 #define DHTTYPE DHT11
 #define SOIL_PIN 34
 #define LIGHT_PIN 32
 #define PUMP_PIN 16
 #define LED_PIN 17
-
 #define I2C_SDA 25
 #define I2C_SCL 26
 
-// ================= PWM =================
-const int pwmFreq = 5000;      // Tần số PWM
-const int pwmResolution = 8;   // Độ phân giải (0-255)
-
-// ================= TIMER =================
-hw_timer_t *timer = NULL;
-volatile bool sensorFlag = false;   // Cờ báo đọc sensor (set từ ISR)
-
-// ================= STATE =================
-bool isAutoMode = true;        // Chế độ Auto / Manual
-bool lastPumpState = false;    // Trạng thái trước đó của bơm
-bool lastLEDState = false;     // Trạng thái trước đó của LED
-
-unsigned long lastBlynkReconnect = 0;
-
-// ================= OBJECT =================
 DHT dht(DHTPIN, DHTTYPE);
 LiquidCrystal_I2C lcd(0x27, 16, 2);
+BlynkTimer timer;
 
-// =====================================================
-// 1. TIMER ISR
-// =====================================================
-/*
- * Ngắt phần cứng Timer
- * - Chạy mỗi 2 giây
- * - Không xử lý logic tại đây (tránh crash)
- * - Chỉ set cờ để loop xử lý
- */
-void IRAM_ATTR onTimer() {
-  sensorFlag = true;
-}
+// BIẾN QUẢN LÝ CHẾ ĐỘ (Khởi động lên mặc định là Tự động)
+bool isAutoMode = true; 
 
-// =====================================================
-// 2. WIFI CONNECT (RETRY + TIMEOUT)
-// =====================================================
-/*
- * Kết nối WiFi có giới hạn retry
- * - Tránh treo hệ thống nếu WiFi lỗi
- * - Timeout sau ~10 giây
- */
-void connectWiFi() {
-  Serial.println("Connecting WiFi...");
-  WiFi.begin(ssid, pass);
-
-  int retry = 0;
-  while (WiFi.status() != WL_CONNECTED && retry < 20) {
-    delay(500);
-    Serial.print(".");
-    retry++;
-  }
-
-  if (WiFi.status() == WL_CONNECTED) {
-    Serial.println("\nWiFi Connected!");
-  } else {
-    Serial.println("\nWiFi FAILED!");
-  }
-}
-
-// =====================================================
-// 3. BLYNK RECONNECT (NON-BLOCKING)
-// =====================================================
-/*
- * Tự động reconnect Blynk
- * - Không dùng delay → non-blocking
- * - Thử lại mỗi 5 giây
- */
-void checkBlynk() {
-  if (!Blynk.connected()) {
-    unsigned long now = millis();
-    if (now - lastBlynkReconnect > 5000) {
-      lastBlynkReconnect = now;
-      Serial.println("Reconnecting Blynk...");
-      Blynk.connect();
-    }
-  }
-}
-
-// =====================================================
-// 4. CONTROL DEVICE
-// =====================================================
-/*
- * Điều khiển bơm
- * - Có chống spam (chỉ gửi khi state thay đổi)
- * - Có phân biệt Auto / Manual
- */
-void controlPump(bool state, bool manual = false) {
-  digitalWrite(PUMP_PIN, state ? HIGH : LOW);
-
-  if (state != lastPumpState) {
-    Blynk.virtualWrite(V5, state);
-
-    String msg = state ? "BẬT" : "TẮT";
-    msg += manual ? " (Manual)" : " (Auto)";
-
-    Blynk.logEvent(state ? "thong_bao_bat" : "thong_bao_tat", "Pump: " + msg);
-    lastPumpState = state;
-  }
-}
-
-/*
- * Điều khiển LED bằng PWM
- * - brightness: 0–255
- */
-void controlLED(int brightness, bool manual = false) {
-  ledcWrite(LED_PIN, brightness);
-
-  bool state = brightness > 0;
-
-  if (state != lastLEDState) {
-    Blynk.virtualWrite(V6, brightness);
-
-    String msg = state ? "BẬT" : "TẮT";
-    msg += manual ? " (Manual)" : " (Auto)";
-
-    Blynk.logEvent(state ? "thong_bao_bat" : "thong_bao_tat", "LED: " + msg);
-    lastLEDState = state;
-  }
-}
-
-// =====================================================
-// 5. SENSOR LOGIC (CORE SYSTEM)
-// =====================================================
-/*
- * Hàm xử lý trung tâm:
- * - Đọc sensor
- * - Xử lý dữ liệu
- * - Hiển thị
- * - Điều khiển thiết bị
- */
-void runSystem() {
-
+// Cờ nhớ trạng thái
+bool lastPumpState = false; 
+bool lastLEDState = false;
+int counter = 0;
+void sendSensorData() {
+  counter++;
+  Serial.println("-----------------------");
+  Serial.print("Lan gui thu: "); Serial.println(counter);
   float h = dht.readHumidity();
   float t = dht.readTemperature();
-
-  // ❗ CHECK lỗi DHT (NaN)
-  if (isnan(h) || isnan(t)) {
-    Serial.println("DHT ERROR!");
-    return;
-  }
-
-  // Convert ADC → %
-  int soil = constrain(map(analogRead(SOIL_PIN), 4095, 1000, 0, 100), 0, 100);
-  int light = constrain(map(analogRead(LIGHT_PIN), 4095, 0, 0, 100), 0, 100);
-
-  // ===== LCD =====
+  int soilPercent = constrain(map(analogRead(SOIL_PIN), 4095, 1000, 0, 100), 0, 100);
+  int lightPercent = constrain(map(analogRead(LIGHT_PIN), 4095, 0, 0, 100), 0, 100);
+  Serial.print("Nhiet do: "); Serial.print(t); Serial.println("C");
+  Serial.print("Do am dat: "); Serial.print(soilPercent); Serial.println("%");
+  Serial.print("Anh sang moi truong: "); Serial.print(lightPercent); Serial.println("%");
+  // Cập nhật LCD
+  lcd.clear(); 
   lcd.setCursor(0, 0);
-  lcd.print("T:" + String((int)t) + " H:" + String((int)h) + "   ");
-
+  lcd.print("T:"); lcd.print((int)t); lcd.print("C");
+  lcd.setCursor(8, 0);
+  lcd.print("H:"); lcd.print((int)h); lcd.print("%");
   lcd.setCursor(0, 1);
-  lcd.print("S:" + String(soil) + " L:" + String(light) + "   ");
+  lcd.print("S:"); lcd.print(soilPercent); lcd.print("%");
+  lcd.setCursor(8, 1);
+  lcd.print("L:"); lcd.print(lightPercent); lcd.print("%");
 
-  // ===== BLYNK =====
+  // Gửi thông số lên App
   Blynk.virtualWrite(V1, t);
-  Blynk.virtualWrite(V2, soil);
-  Blynk.virtualWrite(V3, light);
+  Blynk.virtualWrite(V2, soilPercent);
+  Blynk.virtualWrite(V3, lightPercent);
   Blynk.virtualWrite(V4, h);
-  Blynk.virtualWrite(V0, isAutoMode);
+  
+  // Đồng bộ trạng thái nút V0 lên màn hình điện thoại
+  Blynk.virtualWrite(V0, isAutoMode ? 1 : 0);
 
-  // ===== AUTO MODE =====
-  if (isAutoMode) {
+  // ----------------------------------------------------
+  // KHỐI LOGIC NÀY CHỈ CHẠY KHI Ở CHẾ ĐỘ TỰ ĐỘNG
+  // ----------------------------------------------------
+  if (isAutoMode == true) {
+    
+    // --- Tự động Máy Bơm ---
+    if (soilPercent < 40) {
+      digitalWrite(PUMP_PIN, HIGH);
+      Serial.println(">> TRANG THAI: Dang BAT May Bom");
+      Blynk.virtualWrite(V5, 1); 
+      if (lastPumpState == false) { 
+        Blynk.logEvent("thong_bao_bat", "Đất khô, tự động BẬT bơm!");
+        lastPumpState = true; 
+      }
+    } 
+    else if (soilPercent > 60) {
+      digitalWrite(PUMP_PIN, LOW);
+      Blynk.virtualWrite(V5, 0); 
+      if (lastPumpState == true) { 
+        Blynk.logEvent("thong_bao_tat", "Đất đủ ẩm, tự động TẮT bơm!");
+        lastPumpState = false;
+      }
+    }
 
-    // Hysteresis chống bật/tắt liên tục
-    if (soil < 40) controlPump(true);
-    else if (soil > 70) controlPump(false);
+    // --- Tự động Đèn LED (Khóa công suất 20%) ---
+    int SENSOR_THRESHOLD = 20;  // Ngưỡng cảm biến để tắt đèn (20%)
+    int LED_MAX_POWER = 51;     // Công suất tối đa của LED (20% của 255 là 51)
+    int STEP = 17;              // Bước nhảy để đèn sáng/tối từ từ
 
-    // Điều chỉnh độ sáng LED
-    if (light < 30) {
-      int pwm = map(light, 0, 30, 255, 100);
-      controlLED(pwm);
-    } else if (light > 70) {
-      controlLED(0);
+    static int autoPWM = 0; 
+
+    if (lightPercent > SENSOR_THRESHOLD) {
+      // 1. Nếu có ánh sáng lạ chiếu vào làm cảm biến > 20% -> Tắt đèn dần dần
+      autoPWM -= STEP;
+      if (autoPWM < 0) autoPWM = 0;     
+    }
+    else { 
+      // 2. Nếu cảm biến đọc thấp (< 20%, ví dụ 0%) -> Tăng đèn dần dần đến mức 20%
+      autoPWM += STEP;
+      // Chặn trần ở mức 51 (20% công suất), không cho tăng thêm dù cảm biến vẫn đọc là 0%
+      if (autoPWM > LED_MAX_POWER) autoPWM = LED_MAX_POWER; 
+    }
+
+    // Xuất lệnh ra phần cứng
+    analogWrite(LED_PIN, autoPWM);
+    
+    // Logic báo sự kiện
+    if (autoPWM > 0) { 
+      if (lastLEDState == false) {
+        Blynk.logEvent("thong_bao_bat", "Trời tối, tự động BẬT đèn sáng 20%!");
+        lastLEDState = true;
+      }
+    } else { 
+      if (lastLEDState == true) {
+        Blynk.logEvent("thong_bao_tat", "Có ánh sáng ngoài, tự động TẮT đèn!");
+        lastLEDState = false;
+      }
     }
   }
 }
+// ----------------------------------------------------
+// CÁC HÀM XỬ LÝ NÚT BẤM TRÊN ĐIỆN THOẠI
+// ----------------------------------------------------
 
-// =====================================================
-// 6. BLYNK CALLBACK
-// =====================================================
-/*
- * Nhận dữ liệu từ App Blynk
- * - V0: Auto Mode
- * - V5: Pump
- * - V6: LED
- */
-
-// Auto Mode
+// Nút V0: Chọn chế độ (Tự Động / Thủ Công)
 BLYNK_WRITE(V0) {
-  isAutoMode = param.asInt();
-}
-
-// Manual Pump → override Auto
-BLYNK_WRITE(V5) {
-  isAutoMode = false;
-  controlPump(param.asInt(), true);
-}
-
-// Manual LED → override Auto
-BLYNK_WRITE(V6) {
-  isAutoMode = false;
-  controlLED(param.asInt(), true);
-}
-
-/*
- * Giám sát WiFi
- * - Phát hiện mất kết nối
- * - Tự reconnect
- */
-void checkWiFi() {
-  static bool wasConnected = true;
-
-  if (WiFi.status() != WL_CONNECTED) {
-    if (wasConnected) {
-      Serial.println("WiFi LOST!");
-      wasConnected = false;
-    }
-
-    Serial.println("Reconnecting WiFi...");
-    WiFi.disconnect();
-    WiFi.begin(ssid, pass);
-
-    delay(500);
+  if (param.asInt() == 1) {
+    isAutoMode = true;
+    Blynk.logEvent("thong_bao_bat", "Hệ thống: Đã bật chế độ TỰ ĐỘNG");
   } else {
-    if (!wasConnected) {
-      Serial.println("WiFi RECONNECTED!");
-      wasConnected = true;
+    isAutoMode = false;
+    Blynk.logEvent("thong_bao_tat", "Hệ thống: Đã bật chế độ THỦ CÔNG");
+  }
+}
+
+// Nút V5: Điều khiển Bơm thủ công
+BLYNK_WRITE(V5) {
+  // Ghi đè thông minh: Hễ chạm vào nút V5 là tự động giật quyền về Thủ công
+  isAutoMode = false; 
+  Blynk.virtualWrite(V0, 0); // Gạt luôn nút V0 trên app về OFF (Thủ công)
+
+  int value = param.asInt();
+  if (value == 1) {
+    digitalWrite(PUMP_PIN, HIGH); 
+    Blynk.logEvent("thong_bao_bat", "Đã BẬT máy bơm (Bằng tay)");
+    lastPumpState = true;
+  } else {
+    digitalWrite(PUMP_PIN, LOW); 
+    Blynk.logEvent("thong_bao_tat", "Đã TẮT máy bơm (Bằng tay)");
+    lastPumpState = false;
+  }
+}
+
+// Nút V6: Điều khiển Đèn thủ công bằng thanh trượt (0-100)
+BLYNK_WRITE(V6) {
+  // Ghi đè thông minh: Hễ kéo thanh trượt V6 là tự động giật quyền về Thủ công
+  isAutoMode = false;
+  Blynk.virtualWrite(V0, 0); 
+
+  int sliderPercent = param.asInt(); // Nhận giá trị từ App là 0 đến 100
+  
+  // Ép tỷ lệ 0-100% thành số 0-255 cho phần cứng phát xung PWM
+  int pwmValue = map(sliderPercent, 0, 100, 0, 255); 
+  
+  // Dùng analogWrite thay vì digitalWrite để làm mờ/sáng đèn
+  analogWrite(LED_PIN, pwmValue); 
+
+  // Logic chống Spam Log cho thanh trượt
+  if (sliderPercent > 0) {
+    if (lastLEDState == false) { // Chỉ báo đã BẬT khi kéo từ 0 lên một mức có sáng
+      Blynk.logEvent("thong_bao_bat", "Đã BẬT đèn LED (Bằng tay)");
+      lastLEDState = true;
+    }
+  } else {
+    if (lastLEDState == true) {  // Chỉ báo đã TẮT khi kéo hẳn về 0
+      Blynk.logEvent("thong_bao_tat", "Đã TẮT đèn LED (Bằng tay)");
+      lastLEDState = false;
     }
   }
 }
 
-// =====================================================
-// 7. SETUP
-// =====================================================
-/*
- * Khởi tạo hệ thống:
- * - Serial, LCD
- * - GPIO
- * - PWM
- * - WiFi + Blynk
- * - Timer interrupt
- */
+// ----------------------------------------------------
 void setup() {
   Serial.begin(115200);
-
   Wire.begin(I2C_SDA, I2C_SCL);
-
   lcd.init();
   lcd.backlight();
-  lcd.print("System Boot...");
-
-  // Fail-safe: tắt bơm khi start
+  
   pinMode(PUMP_PIN, OUTPUT);
-  digitalWrite(PUMP_PIN, LOW);
-
-  // PWM (ESP32 Core 3.x)
-  ledcAttach(LED_PIN, pwmFreq, pwmResolution);
-  ledcWrite(LED_PIN, 0);
+  pinMode(LED_PIN, OUTPUT);
+  
+  // Khởi động ở trạng thái TẮT
+  digitalWrite(PUMP_PIN, LOW); 
+  analogWrite(LED_PIN, 0);  
 
   dht.begin();
-
-  connectWiFi();
-
-  Blynk.config(BLYNK_AUTH_TOKEN);
-  Blynk.connect();
-
-  // Timer 2 giây
-  timer = timerBegin(1000000);
-  timerAttachInterrupt(timer, &onTimer);
-  timerAlarm(timer, 2000000, true, 0);
-
-  lcd.clear();
-  lcd.print("Ready!");
+  Blynk.begin(auth, ssid, pass);
+  timer.setInterval(2000L, sendSensorData);
+  
+  lcd.setCursor(0, 0);
+  lcd.print("Blynk Connected!");
 }
 
-// =====================================================
-// 8. LOOP
-// =====================================================
-/*
- * Vòng lặp chính:
- * - Không blocking
- * - Điều phối hệ thống
- */
 void loop() {
-  Blynk.run();        // xử lý Blynk
-  checkBlynk();       // reconnect Blynk
-  checkWiFi();        // reconnect WiFi
-
-  // Chạy theo event từ Timer
-  if (sensorFlag) {
-    sensorFlag = false;
-    runSystem();
-  }
+  Blynk.run();
+  timer.run();
 }
